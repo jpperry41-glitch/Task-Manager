@@ -1,0 +1,798 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc, query, writeBatch } from 'firebase/firestore';
+
+// Firebase configuration (provided by the environment)
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// Utility function for exponential backoff for API calls
+const withExponentialBackoff = async (fn, retries = 5, delay = 1000) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if ((error.code === 'unavailable' || error.message.includes('rate limit')) && i < retries - 1) {
+        await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+      } else {
+        throw error;
+      }
+    }
+  }
+};
+
+const App = () => {
+  const [tasks, setTasks] = useState([]);
+  const [newTaskText, setNewTaskText] = useState('');
+  const [filter, setFilter] = useState('all');
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [generatingSubtasks, setGeneratingSubtasks] = useState(false);
+  const [generatingDescription, setGeneratingDescription] = useState(false);
+  const [showModal, setShowModal] = useState(false);
+  const [modalMessage, setModalMessage] = useState('');
+  
+  // State to handle dashboard view
+  const [showDashboard, setShowDashboard] = useState(true);
+
+  // State to handle editing a task
+  const [editingTask, setEditingTask] = useState(null);
+  const [editedTaskText, setEditedTaskText] = useState('');
+  const [editedCategory, setEditedCategory] = useState('');
+  const [editedPriority, setEditedPriority] = useState('');
+  const [editedDifficulty, setEditedDifficulty] = useState('');
+  const [editedEstimate, setEditedEstimate] = useState('');
+  const [editedProgress, setEditedProgress] = useState(0);
+
+  const categories = ['Personal', 'Work', 'Shopping', 'Health'];
+  const priorities = ['Low', 'Medium', 'High'];
+  const difficulties = ['Easy', 'Medium', 'Hard'];
+
+  // Authentication effect: Signs in user or sets up anonymous user
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
+          } else {
+            await signInAnonymously(auth);
+          }
+        } catch (error) {
+          console.error("Error signing in:", error);
+          setModalMessage("Error signing in. Please try again.");
+          setShowModal(true);
+        }
+      }
+      setIsAuthReady(true);
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  // Firestore data fetching effect: Listens for real-time updates to tasks
+  useEffect(() => {
+    if (isAuthReady && userId) {
+      const tasksCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/tasks`);
+      const q = query(tasksCollectionRef);
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedTasks = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+
+        // Build a hierarchical tree from the flat list of tasks
+        const taskMap = new Map(fetchedTasks.map(task => [task.id, { ...task, subtasks: [] }]));
+        const taskTree = [];
+        taskMap.forEach(task => {
+          if (task.parentId) {
+            const parent = taskMap.get(task.parentId);
+            if (parent) {
+              parent.subtasks.push(task);
+            }
+          } else {
+            taskTree.push(task);
+          }
+        });
+
+        // Sort tasks and subtasks by creation time
+        const sortTasks = (tasks) => {
+            tasks.sort((a, b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
+            tasks.forEach(task => {
+                if (task.subtasks && task.subtasks.length > 0) {
+                    sortTasks(task.subtasks);
+                }
+            });
+        };
+        sortTasks(taskTree);
+        
+        setTasks(taskTree);
+        setLoading(false);
+      }, (error) => {
+        console.error("Error fetching tasks:", error);
+        setModalMessage("Error fetching tasks. Please check your connection.");
+        setShowModal(true);
+        setLoading(false);
+      });
+
+      return () => unsubscribe();
+    }
+  }, [isAuthReady, userId]);
+
+  // Handles adding a new task to Firestore with all new details
+  const handleAddTask = async (taskText) => {
+    if (taskText.trim() === '' || !userId) {
+      setModalMessage("Task cannot be empty.");
+      setShowModal(true);
+      return;
+    }
+    
+    // Set default values for a new top-level task
+    const taskCategory = 'Personal';
+    const taskPriority = 'Medium';
+    const taskDifficulty = 'Medium';
+    const taskEstimate = '';
+    const taskProgress = 0;
+
+    try {
+      await withExponentialBackoff(() =>
+        addDoc(collection(db, `artifacts/${appId}/users/${userId}/tasks`), {
+          text: taskText,
+          completed: false,
+          category: taskCategory,
+          priority: taskPriority,
+          difficulty: taskDifficulty,
+          estimate: taskEstimate,
+          progress: taskProgress,
+          parentId: null,
+          createdAt: new Date(),
+        })
+      );
+      setNewTaskText('');
+    } catch (e) {
+      console.error("Error adding document: ", e);
+      setModalMessage("Failed to add task. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Handles toggling the completion status of a task and its children in Firestore
+  const handleToggleComplete = async (taskId, currentCompleted, subtasks = []) => {
+    if (!userId) return;
+    try {
+      const newCompleted = !currentCompleted;
+      const newProgress = newCompleted ? 100 : 0;
+      
+      const batch = writeBatch(db);
+      const taskDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, taskId);
+      batch.update(taskDocRef, { completed: newCompleted, progress: newProgress });
+
+      // Recursively update all subtasks
+      const updateChildren = (children) => {
+        children.forEach(child => {
+          const childDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, child.id);
+          batch.update(childDocRef, { completed: newCompleted, progress: newProgress });
+          if (child.subtasks && child.subtasks.length > 0) {
+            updateChildren(child.subtasks);
+          }
+        });
+      };
+      updateChildren(subtasks);
+
+      await withExponentialBackoff(() => batch.commit());
+    } catch (e) {
+      console.error("Error updating document: ", e);
+      setModalMessage("Failed to update task. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Handles deleting a task and all its children from Firestore
+  const handleDeleteTask = async (taskId, subtasks = []) => {
+    if (!userId) return;
+    try {
+      const batch = writeBatch(db);
+      
+      const taskDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, taskId);
+      batch.delete(taskDocRef);
+      
+      // Recursively delete all subtasks
+      const deleteChildren = (children) => {
+        children.forEach(child => {
+          const childDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, child.id);
+          batch.delete(childDocRef);
+          if (child.subtasks && child.subtasks.length > 0) {
+            deleteChildren(child.subtasks);
+          }
+        });
+      };
+      deleteChildren(subtasks);
+
+      await withExponentialBackoff(() => batch.commit());
+    } catch (e) {
+      console.error("Error deleting document: ", e);
+      setModalMessage("Failed to delete task. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Function to enter edit mode for a task
+  const handleEditTask = (task) => {
+    setEditingTask(task.id);
+    setEditedTaskText(task.text);
+    setEditedCategory(task.category);
+    setEditedPriority(task.priority);
+    setEditedDifficulty(task.difficulty);
+    setEditedEstimate(task.estimate);
+    setEditedProgress(task.progress || 0);
+  };
+
+  // Function to save the edited task
+  const handleSaveEdit = async (id) => {
+    if (editedTaskText.trim() === '') {
+      setModalMessage("Task text cannot be empty.");
+      setShowModal(true);
+      return;
+    }
+    if (!userId) return;
+
+    try {
+      const taskDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, id);
+      await withExponentialBackoff(() =>
+        updateDoc(taskDocRef, {
+          text: editedTaskText,
+          category: editedCategory,
+          priority: editedPriority,
+          difficulty: editedDifficulty,
+          estimate: editedEstimate,
+          progress: editedProgress,
+          completed: editedProgress === 100 ? true : false,
+        })
+      );
+      setEditingTask(null);
+    } catch (e) {
+      console.error("Error updating document: ", e);
+      setModalMessage("Failed to save edits. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Function to cancel editing a task
+  const handleCancelEdit = () => {
+    setEditingTask(null);
+  };
+
+  // Handles generating subtasks using the Gemini API
+  const handleGenerateSubtasks = async (taskText, parentId) => {
+    if (!userId) {
+      setModalMessage("Please sign in to use this feature.");
+      setShowModal(true);
+      return;
+    }
+    setGeneratingSubtasks(true);
+    setModalMessage("Generating subtasks... This may take a moment.");
+    setShowModal(true);
+
+    try {
+      const prompt = `Break down the following task into a list of smaller, actionable subtasks. Provide the output as a JSON array of strings.
+      Task: ${taskText}`;
+
+      const payload = {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "ARRAY",
+            items: { type: "STRING" }
+          }
+        }
+      };
+
+      const apiKey = "";
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+      const response = await withExponentialBackoff(() =>
+        fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+      );
+
+      const result = await response.json();
+
+      if (result.candidates && result.candidates.length > 0 &&
+          result.candidates[0].content && result.candidates[0].content.parts &&
+          result.candidates[0].content.parts.length > 0) {
+        const jsonString = result.candidates[0].content.parts[0].text;
+        const subtasks = JSON.parse(jsonString);
+
+        if (Array.isArray(subtasks) && subtasks.length > 0) {
+          const batch = writeBatch(db);
+          for (const subtask of subtasks) {
+            if (typeof subtask === 'string' && subtask.trim() !== '') {
+              const newDocRef = doc(collection(db, `artifacts/${appId}/users/${userId}/tasks`));
+              batch.set(newDocRef, {
+                text: subtask,
+                completed: false,
+                category: categories[0],
+                priority: priorities[1],
+                difficulty: difficulties[1],
+                estimate: '',
+                progress: 0,
+                parentId: parentId, // Set the parentId for subtasks
+                createdAt: new Date(),
+              });
+            }
+          }
+          await withExponentialBackoff(() => batch.commit());
+          setModalMessage("Subtasks generated and added successfully!");
+        } else {
+          setModalMessage("Could not generate actionable subtasks for this item.");
+        }
+      } else {
+        setModalMessage("Failed to generate subtasks. Please try again.");
+      }
+    } catch (error) {
+      console.error("Error generating subtasks:", error);
+      setModalMessage("An error occurred while generating subtasks. Please try again.");
+    } finally {
+      setGeneratingSubtasks(false);
+    }
+  };
+
+  // Handles generating a task description using the Gemini API
+  const handleGenerateDescription = async (taskText) => {
+    if (!userId) {
+      setModalMessage("Please sign in to use this feature.");
+      setShowModal(true);
+      return;
+    }
+    setGeneratingDescription(true);
+    setModalMessage("Generating description... This may take a moment.");
+    setShowModal(true);
+
+    try {
+      const prompt = `Write a short, professional, and encouraging description for the following task. Do not include a title.
+      Task: ${taskText}`;
+
+      const payload = {
+        contents: [{ parts: [{ text: prompt }] }],
+      };
+
+      const apiKey = "";
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+      const response = await withExponentialBackoff(() =>
+        fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+      );
+
+      const result = await response.json();
+
+      if (result.candidates && result.candidates.length > 0 &&
+          result.candidates[0].content && result.candidates[0].content.parts &&
+          result.candidates[0].content.parts.length > 0) {
+        const description = result.candidates[0].content.parts[0].text;
+        setModalMessage(description);
+      } else {
+        setModalMessage("Failed to generate a description. Please try again.");
+      }
+    } catch (error) {
+      console.error("Error generating description:", error);
+      setModalMessage("An error occurred while generating a description. Please try again.");
+    } finally {
+      setGeneratingDescription(false);
+      setShowModal(true);
+    }
+  };
+
+  // Filters tasks based on the selected filter option
+  const filteredTasks = tasks.filter(task => {
+    if (filter === 'all' && !task.parentId) return true;
+    if (filter === 'active' && !task.completed && !task.parentId) return true;
+    if (filter === 'completed' && task.completed && !task.parentId) return true;
+    if (categories.includes(filter) && task.category === filter && !task.parentId) return true;
+    return false;
+  });
+
+  const getPriorityColor = (priority) => {
+    switch (priority) {
+      case 'High':
+        return 'bg-red-500';
+      case 'Medium':
+        return 'bg-yellow-500';
+      case 'Low':
+        return 'bg-green-500';
+      default:
+        return 'bg-gray-400';
+    }
+  };
+
+  const getDifficultyColor = (difficulty) => {
+    switch (difficulty) {
+      case 'Hard':
+        return 'bg-red-600';
+      case 'Medium':
+        return 'bg-orange-400';
+      case 'Easy':
+        return 'bg-green-600';
+      default:
+        return 'bg-gray-400';
+    }
+  };
+
+  // Recursive component to render tasks and subtasks
+  const TaskItem = ({ task }) => {
+    const isEditing = editingTask === task.id;
+
+    return (
+      <li
+        key={task.id}
+        className={`flex flex-col sm:flex-row items-start sm:items-center bg-gray-50 p-4 rounded-lg shadow-sm hover:shadow-md transition duration-200 ${task.parentId ? 'ml-6 mt-2' : ''}`}
+      >
+        {isEditing ? (
+          <div className="w-full flex flex-col space-y-2">
+            <input
+              type="text"
+              value={editedTaskText}
+              onChange={(e) => setEditedTaskText(e.target.value)}
+              className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              <select
+                value={editedCategory}
+                onChange={(e) => setEditedCategory(e.target.value)}
+                className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+              </select>
+              <select
+                value={editedPriority}
+                onChange={(e) => setEditedPriority(e.target.value)}
+                className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                {priorities.map(p => <option key={p} value={p}>{p}</option>)}
+              </select>
+              <select
+                value={editedDifficulty}
+                onChange={(e) => setEditedDifficulty(e.target.value)}
+                className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                {difficulties.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <input
+                type="text"
+                placeholder="e.g., 2 hours"
+                value={editedEstimate}
+                onChange={(e) => setEditedEstimate(e.target.value)}
+                className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div className="flex flex-col mt-2">
+              <label className="text-sm font-semibold text-gray-600 mb-1">Progress (%)</label>
+              <input
+                type="number"
+                min="0"
+                max="100"
+                value={editedProgress}
+                onChange={(e) => setEditedProgress(Math.min(100, Math.max(0, Number(e.target.value))))}
+                className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div className="flex space-x-2 justify-end mt-2">
+              <button
+                onClick={() => handleSaveEdit(task.id)}
+                className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-3 rounded-lg shadow-md transition duration-200"
+              >
+                Save
+              </button>
+              <button
+                onClick={handleCancelEdit}
+                className="bg-gray-500 hover:bg-gray-600 text-white font-bold py-2 px-3 rounded-lg shadow-md transition duration-200"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center w-full sm:w-auto mb-2 sm:mb-0">
+              <input
+                type="checkbox"
+                checked={task.completed}
+                onChange={() => handleToggleComplete(task.id, task.completed, task.subtasks)}
+                className="form-checkbox h-5 w-5 text-blue-600 rounded-md cursor-pointer focus:ring-blue-500"
+              />
+              <div className="ml-4 flex-grow">
+                <span
+                  className={`block text-lg ${
+                    task.completed ? 'line-through text-gray-500' : 'text-gray-800'
+                  }`}
+                  onClick={() => handleToggleComplete(task.id, task.completed, task.subtasks)}
+                  style={{ cursor: 'pointer' }}
+                >
+                  {task.text}
+                </span>
+                <div className="flex flex-wrap mt-1 space-x-2 text-xs">
+                  {task.category && (
+                    <span className="bg-gray-300 text-gray-800 font-bold px-2 py-1 rounded-full">
+                      {task.category}
+                    </span>
+                  )}
+                  {task.priority && (
+                    <span className={`text-white font-bold px-2 py-1 rounded-full ${getPriorityColor(task.priority)}`}>
+                      {task.priority} Priority
+                    </span>
+                  )}
+                  {task.difficulty && (
+                    <span className={`text-white font-bold px-2 py-1 rounded-full ${getDifficultyColor(task.difficulty)}`}>
+                      {task.difficulty}
+                    </span>
+                  )}
+                  {task.estimate && (
+                    <span className="bg-blue-300 text-blue-800 font-bold px-2 py-1 rounded-full">
+                      {task.estimate}
+                    </span>
+                  )}
+                </div>
+                {/* Progress Bar */}
+                <div className="w-full bg-gray-200 rounded-full h-2.5 mt-2">
+                  <div
+                    className="bg-purple-600 h-2.5 rounded-full transition-all duration-500"
+                    style={{ width: `${task.progress || 0}%` }}
+                  ></div>
+                </div>
+                <span className="text-xs text-gray-500 mt-1">
+                  {task.progress || 0}% Complete
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center ml-auto space-x-2 flex-wrap justify-end mt-2 sm:mt-0">
+              <button
+                onClick={() => handleEditTask(task)}
+                className="bg-gray-400 hover:bg-gray-500 text-white text-sm font-bold py-2 px-3 rounded-lg shadow-md transition duration-200 transform hover:scale-105 flex items-center justify-center m-1"
+              >
+                Edit
+              </button>
+              {!task.parentId && (
+                <button
+                  onClick={() => handleGenerateSubtasks(task.text, task.id)}
+                  className="bg-purple-500 hover:bg-purple-600 text-white text-sm font-bold py-2 px-3 rounded-lg shadow-md transition duration-200 transform hover:scale-105 flex items-center justify-center m-1"
+                  disabled={generatingSubtasks}
+                >
+                  {generatingSubtasks ? (
+                    <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                  ) : (
+                    <>Break Down ✨</>
+                  )}
+                </button>
+              )}
+              <button
+                onClick={() => handleGenerateDescription(task.text)}
+                className="bg-green-500 hover:bg-green-600 text-white text-sm font-bold py-2 px-3 rounded-lg shadow-md transition duration-200 transform hover:scale-105 flex items-center justify-center m-1"
+                disabled={generatingDescription}
+              >
+                {generatingDescription ? (
+                  <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                ) : (
+                  <>Description ✨</>
+                )}
+              </button>
+              <button
+                onClick={() => handleDeleteTask(task.id, task.subtasks)}
+                className="text-red-500 hover:text-red-700 transition duration-200 p-2 rounded-full hover:bg-red-100 m-1"
+                aria-label="Delete task"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  className="h-6 w-6"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                  />
+                </svg>
+              </button>
+            </div>
+          </>
+        )}
+        {task.subtasks && task.subtasks.length > 0 && (
+            <ul className="w-full mt-2 space-y-2">
+                {task.subtasks.map(subtask => <TaskItem key={subtask.id} task={subtask} />)}
+            </ul>
+        )}
+      </li>
+    );
+  };
+
+  const topLevelTasks = tasks.filter(task => !task.parentId);
+  
+  // Calculate dashboard stats
+  const tasksByCategory = categories.reduce((acc, cat) => {
+    acc[cat] = topLevelTasks.filter(task => task.category === cat).length;
+    return acc;
+  }, {});
+
+  const totalProgress = topLevelTasks.reduce((sum, task) => sum + (task.progress || 0), 0);
+  const averageCompletion = topLevelTasks.length > 0 ? Math.round(totalProgress / topLevelTasks.length) : 0;
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-100">
+        <div className="text-xl font-semibold text-gray-700">Loading tasks...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-blue-100 to-purple-100 flex items-center justify-center p-4 font-inter">
+      <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-lg">
+        <div className="flex justify-center mb-6 space-x-3">
+          <button
+            onClick={() => setShowDashboard(true)}
+            className={`py-2 px-4 rounded-lg font-semibold transition duration-200 m-1 ${
+              showDashboard ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+            }`}
+          >
+            Dashboard
+          </button>
+          <button
+            onClick={() => setShowDashboard(false)}
+            className={`py-2 px-4 rounded-lg font-semibold transition duration-200 m-1 ${
+              !showDashboard ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+            }`}
+          >
+            My Tasks
+          </button>
+        </div>
+
+        <h1 className="text-4xl font-extrabold text-center text-gray-800 mb-8">
+          {showDashboard ? 'Task Dashboard' : 'My Tasks'}
+        </h1>
+
+        {userId && (
+          <div className="text-sm text-gray-500 text-center mb-4">
+            User ID: <span className="font-mono break-all">{userId}</span>
+          </div>
+        )}
+
+        {showDashboard ? (
+          <div>
+            <div className="bg-gray-100 p-6 rounded-xl shadow-inner mb-6">
+              <h2 className="text-2xl font-bold text-gray-700 mb-4">Task Stats</h2>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-center">
+                {Object.keys(tasksByCategory).map(cat => (
+                  <div key={cat} className="bg-white p-4 rounded-lg shadow">
+                    <p className="text-3xl font-extrabold text-blue-600">{tasksByCategory[cat]}</p>
+                    <p className="text-sm text-gray-500 font-semibold">{cat}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-gray-100 p-6 rounded-xl shadow-inner">
+              <h2 className="text-2xl font-bold text-gray-700 mb-4">Average Completion</h2>
+              <div className="w-full bg-gray-200 rounded-full h-4 mt-2">
+                <div
+                  className="bg-purple-600 h-4 rounded-full transition-all duration-500"
+                  style={{ width: `${averageCompletion}%` }}
+                ></div>
+              </div>
+              <p className="text-lg font-bold text-purple-700 text-center mt-2">
+                {averageCompletion}%
+              </p>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex mb-4">
+              <input
+                type="text"
+                className="flex-grow p-3 border-2 border-blue-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-blue-500 transition duration-200"
+                placeholder="Add a new task..."
+                value={newTaskText}
+                onChange={(e) => setNewTaskText(e.target.value)}
+                onKeyPress={(e) => e.key === 'Enter' && handleAddTask(newTaskText)}
+              />
+              <button
+                onClick={() => handleAddTask(newTaskText)}
+                className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-5 rounded-r-lg shadow-md transition duration-200 transform hover:scale-105"
+              >
+                Add
+              </button>
+            </div>
+    
+            <div className="flex justify-center mb-6 space-x-2 flex-wrap">
+              <button
+                onClick={() => setFilter('all')}
+                className={`py-2 px-4 rounded-lg font-semibold transition duration-200 m-1 ${
+                  filter === 'all' ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                }`}
+              >
+                All
+              </button>
+              {categories.map(cat => (
+                <button
+                  key={cat}
+                  onClick={() => setFilter(cat)}
+                  className={`py-2 px-4 rounded-lg font-semibold transition duration-200 m-1 ${
+                    filter === cat ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                  }`}
+                >
+                  {cat}
+                </button>
+              ))}
+              <button
+                onClick={() => setFilter('active')}
+                className={`py-2 px-4 rounded-lg font-semibold transition duration-200 m-1 ${
+                  filter === 'active' ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                }`}
+              >
+                Active
+              </button>
+              <button
+                onClick={() => setFilter('completed')}
+                className={`py-2 px-4 rounded-lg font-semibold transition duration-200 m-1 ${
+                  filter === 'completed' ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                }`}
+              >
+                Completed
+              </button>
+            </div>
+    
+            {filteredTasks.length === 0 ? (
+              <p className="text-center text-gray-500 text-lg mt-8">No tasks found for this filter.</p>
+            ) : (
+              <ul className="space-y-3">
+                {filteredTasks.map(task => <TaskItem key={task.id} task={task} />)}
+              </ul>
+            )}
+          </>
+        )}
+
+        {/* Custom Modal for messages */}
+        {showModal && (
+          <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white p-6 rounded-lg shadow-xl max-w-sm mx-auto text-center">
+              <p className="text-lg font-semibold text-gray-800 mb-4">{modalMessage}</p>
+              <button
+                onClick={() => setShowModal(false)}
+                className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg transition duration-200"
+              >
+                Got It
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default App;
