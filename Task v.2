@@ -1,0 +1,543 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc, query, writeBatch, serverTimestamp } from 'firebase/firestore';
+
+// Firebase configuration (provided by the environment)
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// Utility function for exponential backoff for API calls
+const withExponentialBackoff = async (fn, retries = 5, delay = 1000) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if ((error.code === 'unavailable' || error.message.includes('rate limit')) && i < retries - 1) {
+        await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+      } else {
+        throw error;
+      }
+    }
+  }
+};
+
+const App = () => {
+  const [tasks, setTasks] = useState([]);
+  const [newTaskText, setNewTaskText] = useState('');
+  const [filter, setFilter] = useState('all');
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [generatingSubtasks, setGeneratingSubtasks] = useState(false);
+  const [generatingDescription, setGeneratingDescription] = useState(false);
+  const [showModal, setShowModal] = useState(false);
+  const [modalMessage, setModalMessage] = useState('');
+  // State to handle dashboard view
+  const [showDashboard, setShowDashboard] = useState(true);
+  // State to handle editing a task
+  const [editingTask, setEditingTask] = useState(null);
+  const [editedTaskText, setEditedTaskText] = useState('');
+  const [editedCategory, setEditedCategory] = useState('');
+  const [editedPriority, setEditedPriority] = useState('');
+  const [editedDifficulty, setEditedDifficulty] = useState('');
+  const [editedEstimate, setEditedEstimate] = useState('');
+  const [editedProgress, setEditedProgress] = useState(0);
+
+  const categories = ['Personal', 'Work', 'Shopping', 'Health'];
+  const priorities = ['Low', 'Medium', 'High'];
+  const difficulties = ['Easy', 'Medium', 'Hard'];
+
+  // Authentication effect: Signs in user or sets up anonymous user
+  useEffect(() => {
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(auth, initialAuthToken);
+          } else {
+            await signInAnonymously(auth);
+          }
+        } catch (error) {
+          console.error("Error signing in:", error);
+          setModalMessage("Error signing in. Please try again.");
+          setShowModal(true);
+        }
+      }
+      setIsAuthReady(true);
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  // Firestore data fetching effect: Listens for real-time updates to tasks
+  useEffect(() => {
+    if (isAuthReady && userId) {
+      const tasksCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/tasks`);
+      const q = query(tasksCollectionRef);
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedTasks = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+
+        // Build a hierarchical tree from the flat list of tasks
+        const taskMap = new Map(fetchedTasks.map(task => [task.id, { ...task, subtasks: [] }]));
+        const taskTree = [];
+        taskMap.forEach(task => {
+          if (task.parentId) {
+            const parent = taskMap.get(task.parentId);
+            if (parent) {
+              parent.subtasks.push(task);
+            }
+          } else {
+            taskTree.push(task);
+          }
+        });
+
+        // Sort tasks and subtasks by creation time
+        const sortTasks = (tasks) => {
+          tasks.sort((a, b) => (b.createdAt?.toDate() || 0) - (a.createdAt?.toDate() || 0));
+          tasks.forEach(task => {
+            if (task.subtasks && task.subtasks.length > 0) {
+              sortTasks(task.subtasks);
+            }
+          });
+        };
+        sortTasks(taskTree);
+
+        setTasks(taskTree);
+        setLoading(false);
+      }, (error) => {
+        console.error("Error fetching tasks:", error);
+        setModalMessage("Error fetching tasks. Please check your connection.");
+        setShowModal(true);
+        setLoading(false);
+      });
+
+      return () => unsubscribe();
+    }
+  }, [isAuthReady, userId]);
+
+  // Handles adding a new task to Firestore with all new details
+  const handleAddTask = async (taskText) => {
+    if (taskText.trim() === '' || !userId) {
+      setModalMessage("Task cannot be empty.");
+      setShowModal(true);
+      return;
+    }
+    // Set default values for a new top-level task
+    const taskCategory = 'Personal';
+    const taskPriority = 'Medium';
+    const taskDifficulty = 'Medium';
+    const taskEstimate = '';
+    const taskProgress = 0;
+
+    try {
+      await withExponentialBackoff(() =>
+        addDoc(collection(db, `artifacts/${appId}/users/${userId}/tasks`), {
+          text: taskText,
+          completed: false,
+          category: taskCategory,
+          priority: taskPriority,
+          difficulty: taskDifficulty,
+          estimate: taskEstimate,
+          progress: taskProgress,
+          parentId: null,
+          createdAt: serverTimestamp(),
+        })
+      );
+      setNewTaskText('');
+    } catch (e) {
+      console.error("Error adding document: ", e);
+      setModalMessage("Failed to add task. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Handles toggling the completion status of a task and its children in Firestore
+  const handleToggleComplete = async (taskId, currentCompleted, subtasks = []) => {
+    if (!userId) return;
+    try {
+      const newCompleted = !currentCompleted;
+      const newProgress = newCompleted ? 100 : 0;
+
+      const batch = writeBatch(db);
+      const taskDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, taskId);
+      batch.update(taskDocRef, { completed: newCompleted, progress: newProgress });
+
+      // Recursively update all subtasks
+      const updateChildren = (children) => {
+        children.forEach(child => {
+          const childDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, child.id);
+          batch.update(childDocRef, { completed: newCompleted, progress: newProgress });
+          if (child.subtasks && child.subtasks.length > 0) {
+            updateChildren(child.subtasks);
+          }
+        });
+      };
+      updateChildren(subtasks);
+
+      await withExponentialBackoff(() => batch.commit());
+    } catch (e) {
+      console.error("Error updating document: ", e);
+      setModalMessage("Failed to update task. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Handles deleting a task and all its children from Firestore
+  const handleDeleteTask = async (taskId, subtasks = []) => {
+    if (!userId) return;
+    try {
+      const batch = writeBatch(db);
+
+      const taskDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, taskId);
+      batch.delete(taskDocRef);
+
+      // Recursively delete all subtasks
+      const deleteChildren = (children) => {
+        children.forEach(child => {
+          const childDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, child.id);
+          batch.delete(childDocRef);
+          if (child.subtasks && child.subtasks.length > 0) {
+            deleteChildren(child.subtasks);
+          }
+        });
+      };
+      deleteChildren(subtasks);
+
+      await withExponentialBackoff(() => batch.commit());
+    } catch (e) {
+      console.error("Error deleting document: ", e);
+      setModalMessage("Failed to delete task. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Function to enter edit mode for a task
+  const handleEditTask = (task) => {
+    setEditingTask(task.id);
+    setEditedTaskText(task.text);
+    setEditedCategory(task.category);
+    setEditedPriority(task.priority);
+    setEditedDifficulty(task.difficulty);
+    setEditedEstimate(task.estimate);
+    setEditedProgress(task.progress || 0);
+  };
+
+  // Function to save the edited task
+  const handleSaveEdit = async (id) => {
+    if (editedTaskText.trim() === '') {
+      setModalMessage("Task text cannot be empty.");
+      setShowModal(true);
+      return;
+    }
+    if (!userId) return;
+
+    try {
+      const taskDocRef = doc(db, `artifacts/${appId}/users/${userId}/tasks`, id);
+      await withExponentialBackoff(() =>
+        updateDoc(taskDocRef, {
+          text: editedTaskText,
+          category: editedCategory,
+          priority: editedPriority,
+          difficulty: editedDifficulty,
+          estimate: editedEstimate,
+          progress: editedProgress,
+          completed: editedProgress === 100 ? true : false,
+        })
+      );
+      setEditingTask(null);
+    } catch (e) {
+      console.error("Error updating document: ", e);
+      setModalMessage("Failed to save edits. Please try again.");
+      setShowModal(true);
+    }
+  };
+
+  // Function to cancel editing a task
+  const handleCancelEdit = () => {
+    setEditingTask(null);
+  };
+
+  // Gemini API key: Always use environment variable!
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+
+  // Handles generating subtasks using the Gemini API
+  const handleGenerateSubtasks = async (taskText, parentId) => {
+    if (!userId) {
+      setModalMessage("Please sign in to use this feature.");
+      setShowModal(true);
+      return;
+    }
+    setGeneratingSubtasks(true);
+    setModalMessage("Generating subtasks... This may take a moment.");
+    setShowModal(true);
+
+    try {
+      const prompt = `Break down the following task into a list of smaller, actionable subtasks. Provide the output as a JSON array of strings.
+      Task: ${taskText}`;
+
+      const payload = {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "ARRAY",
+            items: { type: "STRING" }
+          }
+        }
+      };
+
+      const apiKey = GEMINI_API_KEY;
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+      const response = await withExponentialBackoff(() =>
+        fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+      );
+
+      const result = await response.json();
+
+      let subtasks = [];
+      try {
+        if (result.candidates && result.candidates.length > 0 &&
+            result.candidates[0].content && result.candidates[0].content.parts &&
+            result.candidates[0].content.parts.length > 0) {
+          const jsonString = result.candidates[0].content.parts[0].text;
+          subtasks = JSON.parse(jsonString);
+        }
+      } catch (err) {
+        setModalMessage("Failed to parse Gemini response. Please try again.");
+        setGeneratingSubtasks(false);
+        return;
+      }
+
+      if (!Array.isArray(subtasks) || subtasks.length === 0) {
+        setModalMessage("Could not generate actionable subtasks for this item.");
+      } else if (subtasks.length > 450) {
+        setModalMessage("Too many subtasks generated. Please refine your request.");
+      } else {
+        const batch = writeBatch(db);
+        for (const subtask of subtasks) {
+          if (typeof subtask === 'string' && subtask.trim() !== '') {
+            const newDocRef = doc(collection(db, `artifacts/${appId}/users/${userId}/tasks`));
+            batch.set(newDocRef, {
+              text: subtask,
+              completed: false,
+              category: categories[0],
+              priority: priorities[1],
+              difficulty: difficulties[1],
+              estimate: '',
+              progress: 0,
+              parentId: parentId,
+              createdAt: serverTimestamp(),
+            });
+          }
+        }
+        await withExponentialBackoff(() => batch.commit());
+        setModalMessage("Subtasks generated and added successfully!");
+      }
+    } catch (error) {
+      console.error("Error generating subtasks:", error);
+      setModalMessage("An error occurred while generating subtasks. Please try again.");
+    } finally {
+      setGeneratingSubtasks(false);
+    }
+  };
+
+  // Handles generating a task description using the Gemini API
+  const handleGenerateDescription = async (taskText) => {
+    if (!userId) {
+      setModalMessage("Please sign in to use this feature.");
+      setShowModal(true);
+      return;
+    }
+    setGeneratingDescription(true);
+    setModalMessage("Generating description... This may take a moment.");
+    setShowModal(true);
+
+    try {
+      const prompt = `Write a short, professional, and encouraging description for the following task. Do not include a title.
+      Task: ${taskText}`;
+
+      const payload = {
+        contents: [{ parts: [{ text: prompt }] }],
+      };
+
+      const apiKey = GEMINI_API_KEY;
+      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+      const response = await withExponentialBackoff(() =>
+        fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+      );
+
+      const result = await response.json();
+
+      let description = '';
+      try {
+        if (result.candidates && result.candidates.length > 0 &&
+            result.candidates[0].content && result.candidates[0].content.parts &&
+            result.candidates[0].content.parts.length > 0) {
+          description = result.candidates[0].content.parts[0].text;
+        }
+      } catch (err) {
+        setModalMessage("Failed to parse Gemini response. Please try again.");
+        setGeneratingDescription(false);
+        setShowModal(true);
+        return;
+      }
+
+      if (!description) {
+        setModalMessage("Failed to generate a description. Please try again.");
+      } else {
+        setModalMessage(description);
+      }
+    } catch (error) {
+      console.error("Error generating description:", error);
+      setModalMessage("An error occurred while generating a description. Please try again.");
+    } finally {
+      setGeneratingDescription(false);
+      setShowModal(true);
+    }
+  };
+
+  // Filters tasks based on the selected filter option
+  const filteredTasks = tasks.filter(task => {
+    if (filter === 'all' && !task.parentId) return true;
+    if (filter === 'active' && !task.completed && !task.parentId) return true;
+    if (filter === 'completed' && task.completed && !task.parentId) return true;
+    if (categories.includes(filter) && task.category === filter && !task.parentId) return true;
+    return false;
+  });
+
+  const getPriorityColor = (priority) => {
+    switch (priority) {
+      case 'High':
+        return 'bg-red-500';
+      case 'Medium':
+        return 'bg-yellow-500';
+      case 'Low':
+        return 'bg-green-500';
+      default:
+        return 'bg-gray-400';
+    }
+  };
+
+  const getDifficultyColor = (difficulty) => {
+    switch (difficulty) {
+      case 'Hard':
+        return 'bg-red-600';
+      case 'Medium':
+        return 'bg-orange-400';
+      case 'Easy':
+        return 'bg-green-600';
+      default:
+        return 'bg-gray-400';
+    }
+  };
+
+  // Recursive component to render tasks and subtasks
+  const TaskItem = ({ task }) => {
+    const isEditing = editingTask === task.id;
+
+    return (
+      <li
+        key={task.id}
+        className={`flex flex-col sm:flex-row items-start sm:items-center bg-gray-50 p-4 rounded-lg shadow-sm hover:shadow-md transition duration-200 ${task.parentId ? 'ml-6 mt-2' : ''}`}
+      >
+        {isEditing ? (
+          // Edit mode UI...
+          <div className="w-full flex flex-col space-y-2">
+            {/* ... */}
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center w-full sm:w-auto mb-2 sm:mb-0">
+              {/* ... */}
+            </div>
+            <div className="flex items-center ml-auto space-x-2 flex-wrap justify-end mt-2 sm:mt-0">
+              <button
+                onClick={() => handleEditTask(task)}
+                aria-label="Edit task"
+                className="bg-gray-400 hover:bg-gray-500 text-white text-sm font-bold py-2 px-3 rounded-lg shadow-md transition duration-200 transform hover:scale-105 flex items-center justify-center"
+              >
+                Edit
+              </button>
+              {!task.parentId && (
+                <button
+                  onClick={() => handleGenerateSubtasks(task.text, task.id)}
+                  aria-label="Break Down task"
+                  className="bg-purple-500 hover:bg-purple-600 text-white text-sm font-bold py-2 px-3 rounded-lg shadow-md transition duration-200 transform hover:scale-105 flex items-center justify-center"
+                  disabled={generatingSubtasks}
+                >
+                  {generatingSubtasks ? (
+                    <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                  ) : (
+                    <>Break Down ✨</>
+                  )}
+                </button>
+              )}
+              <button
+                onClick={() => handleGenerateDescription(task.text)}
+                aria-label="Generate description"
+                className="bg-green-500 hover:bg-green-600 text-white text-sm font-bold py-2 px-3 rounded-lg shadow-md transition duration-200 transform hover:scale-105 flex items-center justify-center"
+                disabled={generatingDescription}
+              >
+                {generatingDescription ? (
+                  <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                ) : (
+                  <>Description ✨</>
+                )}
+              </button>
+              <button
+                onClick={() => handleDeleteTask(task.id, task.subtasks)}
+                className="text-red-500 hover:text-red-700 transition duration-200 p-2 rounded-full hover:bg-red-100 m-1"
+                aria-label="Delete task"
+              >
+                {/* ... */}
+              </button>
+            </div>
+          </>
+        )}
+        {task.subtasks && task.subtasks.length > 0 && (
+          <ul className="w-full mt-2 space-y-2">
+            {task.subtasks.map(subtask => <TaskItem key={subtask.id} task={subtask} />)}
+          </ul>
+        )}
+      </li>
+    );
+  };
+
+  const topLevelTasks = tasks.filter(task => !task.parentId);
+
+  // Calculate dashboard stats
+  const tasksByCategory = categories.reduce((acc, cat) => {
+    acc[cat] = topLevelTasks.filter(task => task.category === cat).length;
+    return acc;
+  }, {});
+
+  const tota
